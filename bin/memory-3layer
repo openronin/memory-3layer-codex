@@ -152,17 +152,17 @@ session_notes() {
   [[ -f "$f" ]] || return 0
   stamp=$(grep -oE 'last_updated:[[:space:]]*[0-9T:.Z+-]+' "$f" | head -n1 | sed 's/last_updated:[[:space:]]*//')
   if [[ -z "$stamp" ]]; then
-    printf '\n\nNOTE: SESSION.md has no last_updated marker, so it may be out of date. Confirm the goal with the user.'
+    printf '\n\nNOTE: SESSION.md has no last_updated marker, so it may be out of date. Confirm the goal with the user before work that relies on it.'
   else
     epoch=$(to_epoch "$stamp" || echo 0)
     age=$(( $(date +%s) - epoch ))
     if [[ $epoch -gt 0 && $age -gt 86400 ]]; then
-      printf "\n\nSTALE: SESSION.md was last updated %dd %dh ago and may describe another task. Quote its goal to the user and ask whether to continue or reset." $((age / 86400)) $(((age % 86400) / 3600))
+      printf "\n\nSTALE: SESSION.md was last updated %dd %dh ago and may describe another task. Before work that relies on it or writes to it, quote its goal to the user and ask whether to continue or reset. Answer a question that does not depend on it without asking." $((age / 86400)) $(((age % 86400) / 3600))
     fi
   fi
   bytes=$(wc -c < "$f" | tr -d ' ')
   if [[ "${L2_HARD_BYTES:-0}" -gt 0 && "$bytes" -ge "${L2_HARD_BYTES:-0}" ]]; then
-    printf '\n\nL2 HARD LIMIT: SESSION.md is %d KB. Before other work, move closed arcs to the archive and leave a one-line stub for each. Never cut active state.' $((bytes / 1000))
+    printf '\n\nL2 HARD LIMIT: SESSION.md is %d KB. Before other work, move closed arcs to the archive with /memory rotate. Never cut active state.' $((bytes / 1000))
   elif [[ "${L2_SOFT_BYTES:-0}" -gt 0 && "$bytes" -ge "${L2_SOFT_BYTES:-0}" ]]; then
     printf '\n\nL2 SOFT LIMIT: SESSION.md is %d KB. At the next pause, move closed arcs to the archive.' $((bytes / 1000))
   fi

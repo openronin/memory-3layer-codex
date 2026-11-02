@@ -36,7 +36,7 @@ One repo has one L2, whatever branches a session touches. Inside the repo, write
 
 `<repo>` = the git repo root for the current cwd (`git rev-parse --show-toplevel`).
 
-L2 is a **bounded window** of active work, not an unbounded journal. Closed arcs don't accumulate in `SESSION.md` — they're relocated **losslessly** to the recall-only L2 archive (full text moves; a one-line stub + pointer stays inline) via `/memory rotate`. The archive is searchable through `/recall` but never auto-injected into context. **Budget:** keep `SESSION.md` to roughly the active task + the last 1–2 closed arcs — soft ~40 KB / hard ~80 KB, configurable in the file printed by `memory-3layer path config` (`0` = no limit). The session-start hook warns when you cross a limit; rotation is a deliberate decision, not silent truncation.
+L2 is a **bounded window** of active work, not an unbounded journal. Closed arcs don't accumulate in `SESSION.md` — they're relocated **losslessly** to the recall-only L2 archive (full text moves; one summary line per archive file stays inline) via `/memory rotate`. The archive is searchable through `/recall` but never auto-injected into context. **Budget:** keep `SESSION.md` to roughly the active task + the last 1–2 closed arcs — soft ~40 KB / hard ~80 KB, configurable in the file printed by `memory-3layer path config` (`0` = no limit). The session-start hook warns when you cross a limit; rotation is a deliberate decision, not silent truncation.
 
 ## ON SESSION START — DO THIS FIRST
 
@@ -80,11 +80,11 @@ Do this even if a SessionStart hook also fires — idempotent.
    - After every meaningful action: update `# State` (last action, next step)
    - After identifying a key file: append to `# File map` with `path:line — what`
    - Open questions and blockers get their own sections
-   - **Ad-hoc sections are encouraged.** When a phase of work deserves its own block, add it. The template is a floor, not a ceiling. **Give each dated arc a self-summarizing heading** — `# [YYYY-MM-DD] <tag> — <one-line outcome>` — and append a status marker (`СДЕЛАНО` / `ГОТОВО` / `DONE`) when it closes. This makes rotation deterministic and the stub free: the heading IS the summary that stays behind when the body moves to the archive.
+   - **Ad-hoc sections are encouraged.** When a phase of work deserves its own block, add it. The template is a floor, not a ceiling. **Give each dated arc a self-summarizing heading** — `# [YYYY-MM-DD] <tag> — <one-line outcome>` — and append a status marker (`СДЕЛАНО` / `ГОТОВО` / `DONE`) when it closes. This makes rotation deterministic, and the heading is what `/recall` finds once the arc is in the archive.
    - **L2 is a bounded window, not a journal.** Closed arcs don't pile up forever — when the session-start hook warns you've crossed the soft/hard size limit, run `/memory rotate` to relocate closed arcs to the L2 archive (lossless; recall-only). Never let `SESSION.md` grow unbounded; never truncate active state to shrink it (Goal/State/Open questions/Blockers/active arc are off-limits to rotation).
 5. **PreCompact = mandatory flush.** Before compaction: write everything you'd need to resume to SESSION.md. The hook will remind you. After compact, your first action is `Read SESSION.md`.
    - On **every** write to SESSION.md, refresh the top-line `last_updated:` (in YAML frontmatter, or legacy HTML comment) to the current UTC ISO timestamp. The session-start hook uses this to detect stale state.
-   - If the SessionStart hook injects a `SESSION.md is stale` warning (>24h since last_updated), do NOT silently continue with the loaded state — surface it to the user: "SESSION.md last touched <X> ago, goal was <Y>. Continue or reset?"
+   - If the SessionStart hook injects a `SESSION.md is stale` warning (>24h since last_updated), do NOT silently continue with the loaded state. Before work that relies on `SESSION.md` or writes to it, ask the user: "SESSION.md last touched <X> ago, goal was <Y>. Continue or reset?" A question that doesn't depend on it just gets answered.
    - If the hook injects an `L2 SOFT/HARD LIMIT` warning, the file has outgrown its budget — run `/memory rotate` (hard = before continuing other work, soft = at the next natural pause). See rule 4.
 6. **Promotion, not archival.** Cross-session memory persists ONLY when the user explicitly says so ("remember", "запомни"). On such an explicit signal:
    - About the user / their preferences / cross-project credentials → promote into `IDENTITY.md`

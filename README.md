@@ -18,6 +18,6 @@ until you configure a storage. See [the main repository](https://github.com/open
 
 Every file here is built from [openronin/memory-3layer](https://github.com/openronin/memory-3layer)
 and overwritten on each release, so changes made here are lost. Issues and pull requests belong in
-that repository; this one only ships version 7.1.1 of the package.
+that repository; this one only ships version 7.1.2 of the package.
 
 [MIT](LICENSE)

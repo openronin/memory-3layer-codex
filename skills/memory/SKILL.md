@@ -17,7 +17,7 @@ Manage memory protocol behaviour. Default is **explicit-promotion** mode (user m
 
 `/memory refresh` — force `memory-3layer refresh && qmd embed` for all collections NOW (use if hooks didn't fire).
 
-`/memory rotate [--dry-run]` — relocate CLOSED arcs out of `SESSION.md` into a recallable archive, keeping L2 a bounded window of active work. Lossless: the full arc text moves to the archive verbatim; only a one-line stub stays inline. Triggered by the L2 size guardrail in the session-start hook (soft/hard limits in `~/.claude/.memory-config`), or run manually anytime.
+`/memory rotate [--dry-run]` — relocate CLOSED arcs out of `SESSION.md` into a recallable archive, keeping L2 a bounded window of active work. Lossless: the full arc text moves to the archive verbatim; one summary line per archive file stays inline. Triggered by the L2 size guardrail in the session-start hook (soft/hard limits in `~/.claude/.memory-config`), or run manually anytime.
 
 ## How to execute
 
@@ -39,7 +39,9 @@ Manage memory protocol behaviour. Default is **explicit-promotion** mode (user m
 
    d. **Archive target** (alongside `SESSION.md`, in the same project directory, so search already indexes it): `SESSION.archive.YYYY-MM.md` when `L2_ARCHIVE_BY_MONTH=1` (group by the arc's own date), else a single `SESSION.archive.md`. Create with frontmatter `tags: [memory/l2, archive]` on first write; append thereafter. **Never** auto-write into the repo (`<repo>/.claude-docs/`) — a curated changelog is a separate, manual decision.
 
-   e. For each eligible arc: **append its full text verbatim** to the archive, then **replace it in `SESSION.md` with a one-line stub**: the original heading line + ` → archived: SESSION.archive.YYYY-MM.md`. This is relocation, not summarization — no information is lost; the stub is just a pointer.
+   e. For each eligible arc: **append its full text verbatim** to the archive, then **remove it from `SESSION.md`**. Keep one line per archive file: `# Archive YYYY-MM: N arcs → SESSION.archive.YYYY-MM.md` (`# Archive: N arcs → SESSION.archive.md` for a single archive), adding to N if the line exists. This is relocation, not summarization — no information is lost, and `/recall` finds an arc by its heading. An archive line is not an arc: it is never moved.
+
+   Fold older per-arc stubs the same way: a heading ending in ` → archived: <file>` is removed and counted in that file's line, whatever `L2_KEEP_ARCS` says. Its body is already in the archive.
 
    f. Refresh `last_updated`. Report: `N arcs (~X KB) relocated → <archive file>; SESSION.md now ~Y KB`. To restore an arc later, read the archive file directly (or surface it via `/recall`).
 

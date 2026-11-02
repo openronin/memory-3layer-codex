@@ -1,6 +1,6 @@
 {
   "name": "memory-3layer",
-  "version": "7.1.1",
+  "version": "7.1.2",
   "license": "MIT",
   "description": "Agent memory that belongs to no harness: identity, project notes and working state, keyed by repository, synced through your own git storages.",
   "author": {

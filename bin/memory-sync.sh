@@ -7,6 +7,21 @@
 
 set -u
 
+bash4() {
+  # A bash 4 or newer: macOS ships 3.2, and a hook's PATH may not reach Homebrew's.
+  local b
+  for b in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    [[ -x "$b" ]] && "$b" -c '(( BASH_VERSINFO[0] >= 4 ))' 2>/dev/null && { printf '%s' "$b"; return 0; }
+  done
+  return 1
+}
+
+if (( BASH_VERSINFO[0] < 4 )); then
+  if b=$(bash4); then exec "$b" "${BASH_SOURCE[0]}" "$@"; fi
+  echo "memory-3layer: sync needs bash 4 or newer, this is $BASH_VERSION. On macOS: brew install bash" >&2
+  exit 1
+fi
+
 SELF_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 DATA="${MEMORY_3LAYER_HOME:?}"
 STATE="${MEMORY_3LAYER_STATE:?}"
@@ -148,11 +163,20 @@ all_stores() {
 
 store_id() { printf '%s' "$1" | cksum | cut -d' ' -f1; }
 
+to_epoch() {
+  # ISO-8601 to seconds, or nothing. BSD date has no -d. It doesn't read an offset either,
+  # so the marker is taken as UTC there, and that is what the protocol writes.
+  local iso=$1 plain
+  date -d "$iso" +%s 2>/dev/null && return 0
+  plain=${iso%Z}; plain=${plain%%.*}; plain=${plain%%+*}
+  date -j -u -f '%Y-%m-%dT%H:%M:%S' "$plain" +%s 2>/dev/null
+}
+
 stamp_of() {
   # Seconds from the last_updated marker of a file, or nothing.
   local s
   s=$(grep -oE 'last_updated:[[:space:]]*[0-9T:.Z+-]+' "$1" 2>/dev/null | head -n1 | sed 's/last_updated:[[:space:]]*//')
-  [[ -n "$s" ]] && date -d "$s" +%s 2>/dev/null
+  [[ -n "$s" ]] && to_epoch "$s"
 }
 
 theirs_is_newer() {
@@ -212,7 +236,7 @@ access_problem() {
 classify() {
   # classify <exit code> <stderr>. Only this label is shown, never git's own text.
   local e; e=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
-  [[ "$1" == 124 ]] && { printf 'unreachable'; return; }
+  [[ "$1" == 124 || "$1" == 142 ]] && { printf 'unreachable'; return; }
   case "$e" in
     *"host key verification failed"*) printf 'host key not trusted' ;;
     *"permission denied"*|*"authentication failed"*|*"could not read username"*|*"could not read password"*|*"not allowed"*|*"access denied"*|*"not authorized"*|*" 401"*|*" 403"*) printf 'access denied' ;;
@@ -222,11 +246,22 @@ classify() {
   esac
 }
 
+time_limit() {
+  # A command prefix that limits a run to $1 seconds: macOS has no timeout, but has perl.
+  # perl's alarm ends with 142, which classify also reads as a timeout.
+  if command -v timeout >/dev/null; then LIMIT=(timeout "$1")
+  elif command -v gtimeout >/dev/null; then LIMIT=(gtimeout "$1")
+  elif command -v perl >/dev/null; then LIMIT=(perl -e 'alarm shift; exec @ARGV' "$1")
+  else LIMIT=(env)
+  fi
+}
+
 net_git() {
   # git against the current storage, with its access settings and never a prompt.
   # The password reaches git through the environment, so it is not in any argument.
   local rc=0 err ssh key agent user pass
-  local -a envs=(GIT_TERMINAL_PROMPT=0) opts=() wrap=()
+  local -a envs=(GIT_TERMINAL_PROMPT=0) opts=() wrap=() LIMIT=()
+  time_limit "$NET_TIMEOUT"
   NET_WHY=$(access_problem "$ADDR")
   [[ -z "$NET_WHY" ]] || return 1
   ssh="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes -o ConnectTimeout=$NET_TIMEOUT"
@@ -240,7 +275,7 @@ net_git() {
     wrap=(bash "$SELF_DIR/memory-secrets.sh" run "MEMORY_3LAYER_GIT_PASS=$pass" --)
     opts+=(-c credential.helper= -c 'credential.helper=!f() { test "$1" = get && printf "username=%s\npassword=%s\n" "$MEMORY_3LAYER_GIT_USER" "$MEMORY_3LAYER_GIT_PASS"; }; f')
   fi
-  err=$(env "${envs[@]}" GIT_SSH_COMMAND="$ssh" "${wrap[@]}" timeout "$NET_TIMEOUT" git "${opts[@]}" "$@" 2>&1 >/dev/null) || rc=$?
+  err=$(env "${envs[@]}" GIT_SSH_COMMAND="$ssh" "${wrap[@]}" "${LIMIT[@]}" git "${opts[@]}" "$@" 2>&1 >/dev/null) || rc=$?
   [[ $rc -eq 0 ]] && return 0
   NET_WHY=$(classify "$rc" "$err")
   return "$rc"
@@ -618,7 +653,7 @@ cmd_status() {
       done < <(git -C "$clone" ls-files)
     fi
     printf '%s\n  state: %s%s%s\n  files here: %s, commits not pushed: %s\n' "$addr" "$st" "${rest:+ ($rest)}" \
-      "${ts:+, $(date -d "@$ts" '+%F %T' 2>/dev/null)}" "$(routed_files "$addr" | wc -l | tr -d ' ')" "$ahead"
+      "${ts:+, $(date -d "@$ts" '+%F %T' 2>/dev/null || date -r "$ts" '+%F %T' 2>/dev/null)}" "$(routed_files "$addr" | wc -l | tr -d ' ')" "$ahead"
     if [[ $moved -gt 0 ]]; then
       printf '  %d files here are now routed elsewhere. They stay in this storage and its history until removed by hand.\n' "$moved"
     fi

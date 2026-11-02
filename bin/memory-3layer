@@ -31,6 +31,24 @@ STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/memory-3layer"
 
 die() { printf 'memory-3layer: %s\n' "$*" >&2; exit 2; }
 
+bash4() {
+  # A bash 4 or newer: macOS ships 3.2, and a hook's PATH may not reach Homebrew's.
+  local b
+  for b in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    [[ -x "$b" ]] && "$b" -c '(( BASH_VERSINFO[0] >= 4 ))' 2>/dev/null && { printf '%s' "$b"; return 0; }
+  done
+  return 1
+}
+
+to_epoch() {
+  # ISO-8601 to seconds, or nothing. BSD date has no -d. It doesn't read an offset either,
+  # so the marker is taken as UTC there, and that is what the protocol writes.
+  local iso=$1 plain
+  date -d "$iso" +%s 2>/dev/null && return 0
+  plain=${iso%Z}; plain=${plain%%.*}; plain=${plain%%+*}
+  date -j -u -f '%Y-%m-%dT%H:%M:%S' "$plain" +%s 2>/dev/null
+}
+
 normalize_remote() {
   # Accepts https, scp-like and ssh remotes, with or without credentials or a port.
   local u=$1 host rest
@@ -110,7 +128,10 @@ project_key() {
   if [[ -n "$url" ]] && key=$(normalize_remote "$url"); then
     :
   else
-    key="local/${root#"$HOME"/}"; key=${key//\/\//\/}
+    # git prints a physical path, and $HOME may go through a symlink.
+    key=${root#"$HOME"/}
+    [[ "$key" != "$root" ]] || key=${root#"$(cd "$HOME" 2>/dev/null && pwd -P)"/}
+    key="local/$key"; key=${key//\/\//\/}
   fi
   case "/$key/" in */../*|*/./*) die "unsafe project key: $key" ;; esac
   follow_redirect "$key"
@@ -133,7 +154,7 @@ session_notes() {
   if [[ -z "$stamp" ]]; then
     printf '\n\nNOTE: SESSION.md has no last_updated marker, so it may be out of date. Confirm the goal with the user.'
   else
-    epoch=$(date -d "$stamp" +%s 2>/dev/null || echo 0)
+    epoch=$(to_epoch "$stamp" || echo 0)
     age=$(( $(date +%s) - epoch ))
     if [[ $epoch -gt 0 && $age -gt 86400 ]]; then
       printf "\n\nSTALE: SESSION.md was last updated %dd %dh ago and may describe another task. Quote its goal to the user and ask whether to continue or reset." $((age / 86400)) $(((age % 86400) / 3600))
@@ -150,6 +171,9 @@ session_notes() {
 sync_notes() {
   # What an agent must know about sync: a storage that is down, a conflict to merge.
   local pd=$1 f st addr rest
+  if (( BASH_VERSINFO[0] < 4 )) && [[ -f "$(dirname "$CONFIG_FILE")/storage.conf" ]] && ! bash4 >/dev/null; then
+    printf '\n\nSYNC: not running, it needs bash 4 or newer and this is %s. Tell the user: brew install bash' "$BASH_VERSION"
+  fi
   for f in "$STATE_DIR"/stores/*.state; do
     [[ -f "$f" ]] || continue
     IFS=$'\t' read -r st _ addr rest < "$f"
@@ -187,7 +211,7 @@ cmd_context() {
   local format=text event=SessionStart input=""
   [[ "${1:-}" == --hook-format ]] && format=${2:-text}
   if [[ ! -t 0 ]]; then
-    input=$(timeout 1 cat 2>/dev/null || true)
+    IFS= read -r -d '' -t 1 input || true
     if [[ "$input" =~ \"hook_event_name\"[[:space:]]*:[[:space:]]*\"([A-Za-z]+)\" ]]; then
       event=${BASH_REMATCH[1]}; [[ "$format" == text ]] && format=hook
     fi
@@ -471,7 +495,12 @@ case "$cmd" in
   key) project_key "${1:-$PWD}"; echo ;;
   context) cmd_context "$@" ;;
   sync) MEMORY_3LAYER_HOME="$HOME_DIR" MEMORY_3LAYER_STATE="$STATE_DIR" MEMORY_3LAYER_CONFIG_DIR="$(dirname "$CONFIG_FILE")" MEMORY_3LAYER_SECRETS="$SECRETS_DIR" exec bash "$SELF_DIR/memory-sync.sh" "$@" ;;
-  migrate) cmd_migrate "$@" ;;
+  migrate)
+    if (( BASH_VERSINFO[0] < 4 )); then
+      b=$(bash4) || die "migrate needs bash 4 or newer. On macOS: brew install bash"
+      exec "$b" "${BASH_SOURCE[0]}" migrate "$@"
+    fi
+    cmd_migrate "$@" ;;
   import) cmd_import "$@" ;;
   pin) cmd_pin "$@" ;;
   unpin) cmd_unpin "$@" ;;

@@ -58,6 +58,30 @@ human_age() {  # seconds -> "1h 2m" / "3m" / "12s"
   else printf '%ds' "$s"; fi
 }
 
+# --- BSD and macOS: no timeout, no GNU stat, no etimes in ps ---
+run_timeout() {
+  local secs=$1; shift
+  if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"
+  elif command -v perl >/dev/null 2>&1; then perl -e 'alarm shift; exec @ARGV' "$secs" "$@"
+  else "$@"; fi
+}
+
+file_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
+
+elapsed_to_secs() {  # [[DD-]HH:]MM:SS -> seconds
+  local t=$1 days=0 p
+  if [[ "$t" == *-* ]]; then days=$(( 10#${t%%-*} )); t=${t##*-}; fi
+  local -a parts=()
+  IFS=: read -r -a parts <<< "$t"
+  case ${#parts[@]} in
+    2) p=$(( 10#${parts[0]} * 60 + 10#${parts[1]} )) ;;
+    3) p=$(( 10#${parts[0]} * 3600 + 10#${parts[1]} * 60 + 10#${parts[2]} )) ;;
+    *) p=0 ;;
+  esac
+  printf '%s' $(( days * 86400 + p ))
+}
+
 # --- gather: memory-related processes (node running qmd, ctags) ---
 # Output format: pid|ram_mb|age_seconds|kind  (one line per process)
 # NOTE: PowerShell block uses bash DOUBLE-quotes with \" / \$ escaping. Do NOT
@@ -77,12 +101,17 @@ get_procs() {
       }
     " 2>/dev/null | tr -d '\r' | grep -E '^[0-9]+\|'
   else
-    # Linux / macOS: etimes = elapsed seconds (requires modern ps, available on
-    # GNU coreutils and macOS 10.9+). rss is in KiB on both platforms.
-    ps -eo pid,etimes,rss,command 2>/dev/null \
+    # etimes is plain seconds, but BSD ps has only etime. Its output is what shows
+    # support: the exit code may not, and a dropped column shifts every field.
+    # rss is in KiB on both platforms.
+    local age_field=etime
+    [[ "$(ps -o etimes= -p $$ 2>/dev/null | tr -d ' ')" =~ ^[0-9]+$ ]] && age_field=etimes
+    ps -eo "pid,$age_field,rss,command" 2>/dev/null \
       | grep -E 'qmd (embed|update|query|search|vsearch)|ctags' \
       | grep -v grep \
       | while read -r pid age rss rest; do
+          [[ "$pid" =~ ^[0-9]+$ && "$rss" =~ ^[0-9]+$ ]] || continue
+          [[ "$age_field" == etime ]] && age=$(elapsed_to_secs "$age")
           local ram=$(( rss / 1024 ))
           local kind
           case "$rest" in
@@ -139,10 +168,10 @@ get_cpu_time() {
 # a concurrent `qmd update`).
 get_qmd_status() {
   local out
-  out=$(timeout 25 qmd status 2>/dev/null | tr -d '\r')
+  out=$(run_timeout 25 qmd status 2>/dev/null | tr -d '\r')
   if ! echo "$out" | grep -qiE 'Vectors:'; then
     sleep 1
-    out=$(timeout 25 qmd status 2>/dev/null | tr -d '\r')
+    out=$(run_timeout 25 qmd status 2>/dev/null | tr -d '\r')
   fi
   printf '%s' "$out"
 }
@@ -209,7 +238,7 @@ render() {
   for lg in qmd-refresh.log qmd-embed.log qmd-embed-retry.log; do
     local p="$STATE_DIR/$lg"
     [[ -f "$p" ]] || continue
-    local mt; mt=$(stat -c %Y "$p" 2>/dev/null || echo 0)
+    local mt; mt=$(file_mtime "$p")
     local lastline; lastline=$(grep -vE '^\s*$|\[?\?25|^\[2K' "$p" 2>/dev/null | tail -1 | tr -d '\r' | cut -c1-58)
     printf '  %s%-22s%s %s ago  %s%s%s\n' "$c_dim" "$lg" "$c_reset" "$(human_age $((now - mt)))" "$c_dim" "$lastline" "$c_reset"
   done

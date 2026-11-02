@@ -125,7 +125,7 @@ default_paths() {
 cmd_scan() {
   local found=0 f p ln kind v
   local -a paths=()
-  if [[ $# -gt 0 ]]; then paths=("$@"); else mapfile -t paths < <(default_paths); fi
+  if [[ $# -gt 0 ]]; then paths=("$@"); else while IFS= read -r f; do paths+=("$f"); done < <(default_paths); fi
   [[ ${#paths[@]} -gt 0 ]] || return 0
   while IFS= read -r f; do
     while IFS=$'\t' read -r ln kind v; do
@@ -214,7 +214,8 @@ if t == "apply_patch" or patch.lstrip().startswith("*** Begin Patch"):
                 files.append(os.path.realpath(os.path.join(cwd, os.path.expanduser(l[len(mark):].strip()))))
         if l.startswith("+"): added.append(l[1:])
     home = os.path.realpath(os.environ["M_HOME"])
-    print(t); print("\t".join(files)); print(0); sys.stdout.write("\n".join(added)); sys.exit()
+    inside = any(f.startswith(home + os.sep) for f in files)
+    print(t); print("\t".join(files)); print(1 if inside else 0); sys.stdout.write("\n".join(added)); sys.exit()
 if t == "Write": text = i.get("content", "")
 elif t == "Edit": text = i.get("new_string", "")
 elif t == "MultiEdit": text = "\n".join(e.get("new_string", "") for e in i.get("edits", []))
@@ -235,7 +236,7 @@ print(t); print(real); print(1 if inside else 0); sys.stdout.write(text)
     Patch)
       local f hit=0
       while IFS= read -r f; do is_memory_path "$f" && hit=1; done < <(printf '%s\n' "$path" | tr '\t' '\n')
-      [[ $hit -eq 1 ]] || return 0 ;;
+      [[ $hit -eq 1 || "$inside" == 1 ]] || return 0 ;;
     Read|Write|Edit|MultiEdit) [[ "$inside" == 1 ]] || is_memory_path "$path" || return 0 ;;
     *) return 0 ;;
   esac

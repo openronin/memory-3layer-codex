@@ -1,0 +1,20 @@
+{
+  "name": "memory-3layer",
+  "interface": {
+    "displayName": "memory-3layer"
+  },
+  "plugins": [
+    {
+      "name": "memory-3layer",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

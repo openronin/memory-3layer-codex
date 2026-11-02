@@ -1,0 +1,17 @@
+{
+  "description": "Loads memory at session start, blocks secrets in memory writes, flushes before compaction, syncs at session end.",
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "bash \"${PLUGIN_ROOT}/scripts/session-start.sh\"", "timeout": 60 } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "Bash|apply_patch|Edit|Write", "hooks": [ { "type": "command", "command": "bash \"${PLUGIN_ROOT}/bin/memory-3layer\" guard", "timeout": 15 } ] }
+    ],
+    "PreCompact": [
+      { "hooks": [ { "type": "command", "command": "bash \"${PLUGIN_ROOT}/scripts/pre-compact.sh\"", "timeout": 15 } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "bash \"${PLUGIN_ROOT}/scripts/session-end.sh\"", "timeout": 15 } ] }
+    ]
+  }
+}

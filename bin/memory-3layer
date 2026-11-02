@@ -1,0 +1,487 @@
+#!/usr/bin/env bash
+# memory-3layer — agent memory that belongs to no harness.
+#
+# Data lives outside any harness directory, keyed by the project's git remote, so
+# the same project resolves to the same memory on any machine and in any agent.
+# A harness's own memory stays its own business: this tool never reads, writes or
+# configures it.
+#
+#   $MEMORY_3LAYER_HOME       default ~/.local/share/memory-3layer
+#   $MEMORY_3LAYER_SECRETS    default ~/.local/share/memory-3layer-secrets (never synced)
+#   $MEMORY_3LAYER_CONFIG     default ~/.config/memory-3layer/config
+
+set -u
+
+SELF_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+DATA_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}"
+CONFIG_FILE="${MEMORY_3LAYER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/memory-3layer/config}"
+
+L2_SOFT_BYTES=40000
+L2_HARD_BYTES=80000
+_env_home="${MEMORY_3LAYER_HOME:-}"
+# shellcheck disable=SC1090
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE" 2>/dev/null
+# The environment beats the config file, the config file beats the default.
+HOME_DIR="${_env_home:-${MEMORY_3LAYER_HOME:-$DATA_ROOT/memory-3layer}}"
+SECRETS_DIR="${MEMORY_3LAYER_SECRETS:-$DATA_ROOT/memory-3layer-secrets}"
+
+UNASSIGNED=_unassigned
+PIN_FILE=.memory-3layer-key
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/memory-3layer"
+
+die() { printf 'memory-3layer: %s\n' "$*" >&2; exit 2; }
+
+normalize_remote() {
+  # Accepts https, scp-like and ssh remotes, with or without credentials or a port.
+  local u=$1 host rest
+  u=${u%/}; u=${u%.git}; u=${u%.GIT}
+  if [[ "$u" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*://(.*)$ ]]; then
+    u=${BASH_REMATCH[1]}; u=${u#*@}
+    host=${u%%/*}; rest=${u#*/}; host=${host%%:*}
+  elif [[ "$u" =~ ^([^/:]+):(.+)$ ]]; then
+    host=${BASH_REMATCH[1]}; rest=${BASH_REMATCH[2]}; host=${host#*@}
+  else
+    return 1
+  fi
+  [[ -n "$host" && -n "$rest" && "$rest" != "$host" ]] || return 1
+  rest=${rest#/}
+  printf '%s/%s' "$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')" "$rest"
+}
+
+valid_key() {
+  [[ "$1" =~ ^[A-Za-z0-9._/-]+$ && "$1" != "$UNASSIGNED"* && "$1" != /* && "$1" != */ ]] || return 1
+  case "/$1/" in */../*|*/./*|*//*) return 1 ;; esac
+}
+
+read_pin() {
+  # Print a valid key from a marker file. A broken marker counts as no marker, so the
+  # project falls back to its remote or path instead of failing.
+  local f=$1/$PIN_FILE key
+  [[ -f "$f" ]] || return 1
+  IFS= read -r key < "$f" || [[ -n "$key" ]] || return 1
+  key=${key%$'\r'}
+  valid_key "$key" || { printf 'memory-3layer: ignoring invalid key in %s\n' "$f" >&2; return 1; }
+  printf '%s' "$key"
+}
+
+pinned_key() {
+  # The marker is untracked, so a worktree doesn't have it: look in the main checkout
+  # too. Outside git, walk up to $HOME so subdirectories share their project's key.
+  local root=$1 is_git=$2 common up
+  read_pin "$root" && return 0
+  if [[ "$is_git" == 1 ]]; then
+    common=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
+    [[ "${common##*/}" == .git ]] && read_pin "${common%/.git}" && return 0
+    return 1
+  fi
+  up=$root
+  while [[ "$up" != "$HOME" && "$up" != / && -n "$up" ]]; do
+    up=${up%/*}; [[ -n "$up" ]] || up=/
+    read_pin "$up" && return 0
+  done
+  return 1
+}
+
+follow_redirect() {
+  # After a rekey, every machine still on the old remote must reach the new data.
+  local key=$1 next i
+  for i in 1 2 3 4 5; do
+    next=$(alias_for "$key") || break
+    key=$next
+  done
+  printf '%s' "$key"
+}
+
+project_root() {
+  local dir=${1:-$PWD}
+  git -C "$dir" rev-parse --show-toplevel 2>/dev/null || (cd "$dir" 2>/dev/null && pwd) || die "no such directory: $dir"
+}
+
+project_key() {
+  # In order: a pinned key, the git remote, the path under $HOME. Each step falls back
+  # to the next. A worktree and any subdirectory get the same key as the main checkout.
+  local dir=${1:-$PWD} root url key is_git=0
+  git -C "$dir" rev-parse --show-toplevel >/dev/null 2>&1 && is_git=1
+  root=$(project_root "$dir")
+  if key=$(pinned_key "$root" "$is_git"); then
+    printf '%s' "$key"; return 0
+  fi
+  url=$(git -C "$root" remote get-url origin 2>/dev/null) || url=""
+  if [[ -n "$url" ]] && key=$(normalize_remote "$url"); then
+    :
+  else
+    key="local/${root#"$HOME"/}"; key=${key//\/\//\/}
+  fi
+  case "/$key/" in */../*|*/./*) die "unsafe project key: $key" ;; esac
+  follow_redirect "$key"
+}
+
+project_dir() { printf '%s/projects/%s' "$HOME_DIR" "$(project_key "${1:-$PWD}")"; }
+identity_file() { printf '%s/identity/IDENTITY.md' "$HOME_DIR"; }
+
+json_escape() {
+  local s=$1
+  s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\n'/\\n}; s=${s//$'\r'/\\r}; s=${s//$'\t'/\\t}
+  printf '%s' "$s"
+}
+
+session_notes() {
+  # Staleness and size warnings for the SESSION.md at $1.
+  local f=$1 stamp epoch age bytes
+  [[ -f "$f" ]] || return 0
+  stamp=$(grep -oE 'last_updated:[[:space:]]*[0-9T:.Z+-]+' "$f" | head -n1 | sed 's/last_updated:[[:space:]]*//')
+  if [[ -z "$stamp" ]]; then
+    printf '\n\nNOTE: SESSION.md has no last_updated marker, so it may be out of date. Confirm the goal with the user.'
+  else
+    epoch=$(date -d "$stamp" +%s 2>/dev/null || echo 0)
+    age=$(( $(date +%s) - epoch ))
+    if [[ $epoch -gt 0 && $age -gt 86400 ]]; then
+      printf "\n\nSTALE: SESSION.md was last updated %dd %dh ago and may describe another task. Quote its goal to the user and ask whether to continue or reset." $((age / 86400)) $(((age % 86400) / 3600))
+    fi
+  fi
+  bytes=$(wc -c < "$f" | tr -d ' ')
+  if [[ "${L2_HARD_BYTES:-0}" -gt 0 && "$bytes" -ge "${L2_HARD_BYTES:-0}" ]]; then
+    printf '\n\nL2 HARD LIMIT: SESSION.md is %d KB. Before other work, move closed arcs to the archive and leave a one-line stub for each. Never cut active state.' $((bytes / 1000))
+  elif [[ "${L2_SOFT_BYTES:-0}" -gt 0 && "$bytes" -ge "${L2_SOFT_BYTES:-0}" ]]; then
+    printf '\n\nL2 SOFT LIMIT: SESSION.md is %d KB. At the next pause, move closed arcs to the archive.' $((bytes / 1000))
+  fi
+}
+
+sync_notes() {
+  # What an agent must know about sync: a storage that is down, a conflict to merge.
+  local pd=$1 f st addr rest
+  for f in "$STATE_DIR"/stores/*.state; do
+    [[ -f "$f" ]] || continue
+    IFS=$'\t' read -r st _ addr rest < "$f"
+    [[ "$st" == fail ]] && printf '\n\nSYNC: storage %s: %s, so this may not be the latest data from other machines. Tell the user; memory-3layer sync check explains the fix.' "$addr" "$rest"
+  done
+  if compgen -G "$pd/superseded/conflict-*/*" >/dev/null; then
+    printf '\n\nSYNC CONFLICT: another version of a file from a different machine is in %s/superseded/conflict-*/. Compare it with the current file, merge what matters with the user, then delete it.' "$pd"
+  fi
+}
+
+context_text() {
+  local pd id
+  pd=$(project_dir); id=$(identity_file)
+  cat <<TEXT
+MEMORY-3LAYER ACTIVE. Anything that must survive a new machine or a different agent goes here, not into this harness's own memory, if it has one.
+
+Before your first response, read if they exist:
+1. $id
+2. $pd/SESSION.md (working state, treat as authoritative)
+3. $pd/project.md
+
+Client: $SELF_DIR/memory-3layer. Rules for where a fact belongs: the memory protocol, in CLAUDE.md or the protocol skill.
+
+Keep SESSION.md current as you work: decisions with rationale, last action, next step, and a fresh last_updated. Never write a secret value into memory; write secret://<name>.
+TEXT
+  if compgen -G "$pd/imported/*/*.md" >/dev/null; then
+    printf '\nNotes imported from a harness are in %s/imported/. They are not reviewed: read them when relevant, verify them, and propose moving what still holds into project.md or the repo docs.\n' "$pd"
+  fi
+  session_notes "$pd/SESSION.md"
+  sync_notes "$pd"
+}
+
+cmd_context() {
+  # With --hook-format, or JSON naming a hook event on stdin, answer as a hook.
+  local format=text event=SessionStart input=""
+  [[ "${1:-}" == --hook-format ]] && format=${2:-text}
+  if [[ ! -t 0 ]]; then
+    input=$(timeout 1 cat 2>/dev/null || true)
+    if [[ "$input" =~ \"hook_event_name\"[[:space:]]*:[[:space:]]*\"([A-Za-z]+)\" ]]; then
+      event=${BASH_REMATCH[1]}; [[ "$format" == text ]] && format=hook
+    fi
+  fi
+  local text; text=$(context_text)
+  if [[ "$format" == hook ]]; then
+    printf '{"hookSpecificOutput":{"hookEventName":"%s","additionalContext":"%s"}}\n' "$event" "$(json_escape "$text")"
+  else
+    printf '%s\n' "$text"
+  fi
+}
+
+cmd_import() {
+  # import <harness> [--apply]: copy a harness's own memory into imported/<harness>/.
+  # Shows the plan by default. The source is never changed, a file with a secret is
+  # never copied, and the copy is a mirror: promoting a fact is a separate decision.
+  local harness=${1:-} apply=0 adapter root
+  [[ -n "$harness" ]] || die "usage: import <harness> [--apply]"
+  [[ "${2:-}" == --apply ]] && apply=1
+  [[ "$harness" =~ ^[a-z0-9-]+$ ]] || die "bad harness name '$harness'"
+  root=$(cd "$SELF_DIR/.." && pwd)
+  adapter="$root/harness/$harness/import-memory"
+  [[ -x "$adapter" ]] || die "no importer for '$harness' (looked for $adapter)"
+  local rows; rows=$("$adapter") || die "the $harness importer failed"
+  local dir label kind file key dest new=0 changed=0 same=0 secret=0 unknown=0
+  while IFS=$'\t' read -r dir label kind file; do
+    [[ -n "$file" ]] || continue
+    if ! bash "$SELF_DIR/memory-secrets.sh" scan "$file" >/dev/null; then
+      printf 'SECRET, skipped  %s\n' "$file"; secret=$((secret + 1)); continue
+    fi
+    if [[ "$dir" == - ]]; then
+      # Kept rather than dropped: a person can assign these later.
+      if key=$(alias_for "$label"); then :; else
+        key="$UNASSIGNED/$label"; [[ -f "$HOME_DIR/projects/$key/imported/$harness/${file##*/}" ]] || unknown=$((unknown + 1))
+      fi
+    else
+      key=$(project_key "$dir")
+    fi
+    dest="$HOME_DIR/projects/$key/imported/$harness/${file##*/}"
+    if [[ -f "$dest" ]] && cmp -s "$file" "$dest"; then
+      same=$((same + 1)); continue
+    fi
+    if [[ -f "$dest" ]]; then
+      printf 'update           %s/%s\n' "$key" "${file##*/}"; changed=$((changed + 1))
+    else
+      printf 'new %-12s %s/%s\n' "$kind" "$key" "${file##*/}"; new=$((new + 1))
+    fi
+    if [[ $apply -eq 1 ]]; then
+      mkdir -p "${dest%/*}" && cp "$file" "$dest" || die "cannot write $dest"
+    fi
+  done <<< "$rows"
+  printf '\n%s: %d new, %d updated, %d already imported, %d with secrets, %d without a known project\n' "$harness" "$new" "$changed" "$same" "$secret" "$unknown"
+  [[ $apply -eq 1 ]] || printf 'Nothing was changed. Add --apply to copy.\n'
+}
+
+cmd_migrate() {
+  # migrate <harness> [--apply]: copy data of an older version out of a harness's
+  # directory. The source is never changed, and this is safe to repeat until the
+  # switch: a destination that is newer than its source is left alone. When several
+  # old folders map to one project, the newest file takes the name and a different
+  # older one is kept under superseded/<old folder>/.
+  local harness=${1:-} apply=0 adapter rows
+  [[ -n "$harness" ]] || die "usage: migrate <harness> [--apply]"
+  [[ "${2:-}" == --apply ]] && apply=1
+  [[ "$harness" =~ ^[a-z0-9-]+$ ]] || die "bad harness name '$harness'"
+  adapter="$(cd "$SELF_DIR/.." && pwd)/harness/$harness/import-memory"
+  [[ -x "$adapter" ]] || die "no adapter for '$harness'"
+  rows=$("$adapter" --legacy) || die "the $harness adapter failed"
+  local stamp dir label kind file key dest name copied=0 same=0 kept=0 dup=0 old=0 secret=0 unknown=0
+  local -A winner=()
+  while IFS=$'\t' read -r stamp dir label kind file; do
+    [[ -n "$file" ]] || continue
+    name=${file##*/}
+    case "$kind" in
+      identity) dest=$(identity_file) ;;
+      config) dest=$CONFIG_FILE ;;
+      *)
+        if [[ "$dir" == - ]]; then
+          if key=$(alias_for "$label"); then :; else
+            key="$UNASSIGNED/$label"; unknown=$((unknown + 1))
+          fi
+        else
+          key=$(project_key "$dir")
+        fi
+        dest="$HOME_DIR/projects/$key/$name" ;;
+    esac
+    if ! bash "$SELF_DIR/memory-secrets.sh" scan "$file" >/dev/null; then
+      [[ "$kind" == config ]] || { printf 'SECRET, skipped  %s\n' "$file"; secret=$((secret + 1)); continue; }
+    fi
+    if [[ -n "${winner[$dest]:-}" ]]; then
+      if cmp -s "$file" "${winner[$dest]}"; then
+        dup=$((dup + 1)); printf 'duplicate        %s (same as the newer copy)\n' "$file"; continue
+      fi
+      dest="${dest%/*}/superseded/$label/$name"; old=$((old + 1))
+      printf 'older variant    %s -> %s\n' "$file" "${dest#"$HOME_DIR"/}"
+    else
+      winner[$dest]=$file
+    fi
+    if [[ -f "$dest" ]] && cmp -s "$file" "$dest"; then
+      same=$((same + 1)); continue
+    fi
+    if [[ -f "$dest" && "$dest" -nt "$file" ]]; then
+      printf 'kept newer       %s\n' "$dest"; kept=$((kept + 1)); continue
+    fi
+    copied=$((copied + 1))
+    if [[ $apply -eq 1 ]]; then
+      mkdir -p "${dest%/*}" && cp -p "$file" "$dest" || die "cannot write $dest"
+    fi
+  done < <(while IFS=$'\t' read -r dir label kind file; do
+      [[ -n "$file" ]] && printf '%s\t%s\t%s\t%s\t%s\n' "$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file")" "$dir" "$label" "$kind" "$file"
+    done <<< "$rows" | sort -rn)
+  printf '\n%s: %d to copy, %d already there, %d kept newer, %d duplicates, %d older variants, %d with secrets, %d files in %s\n' "$harness" "$copied" "$same" "$kept" "$dup" "$old" "$secret" "$unknown" "projects/$UNASSIGNED"
+  [[ $apply -eq 1 ]] || printf 'Nothing was changed. Add --apply to copy.\n'
+}
+
+alias_for() {
+  # The key a person assigned to an old folder, if any.
+  [[ -f "$HOME_DIR/aliases.tsv" ]] || return 1
+  awk -F'\t' -v l="$1" '$1 == l { k = $2 } END { if (k == "") exit 1; print k }' "$HOME_DIR/aliases.tsv"
+}
+
+move_tree() {
+  # Move <src> into <dest dir>. Nothing is lost: an identical file is dropped, a
+  # different one is kept under superseded/<label>/.
+  local src=$1 target=$2 label=$3 f rel dest moved=0 dup=0 old=0
+  if [[ -d "$src" ]]; then
+    while IFS= read -r f; do
+      rel=${f#"$src"/}
+      dest="$target/$rel"
+      if [[ -f "$dest" ]]; then
+        if cmp -s "$f" "$dest"; then rm "$f"; dup=$((dup + 1)); continue; fi
+        dest="$target/superseded/$label/$rel"; old=$((old + 1))
+      else
+        moved=$((moved + 1))
+      fi
+      mkdir -p "${dest%/*}" && mv "$f" "$dest" || die "cannot move $f"
+    done < <(find "$src" -type f)
+    find "$src" -depth -type d -empty -delete
+  fi
+  printf '%d moved, %d identical dropped, %d kept under superseded/' "$moved" "$dup" "$old"
+}
+
+remember_alias() {
+  mkdir -p "$HOME_DIR"
+  alias_for "$1" >/dev/null || printf '%s\t%s\n' "$1" "$2" >> "$HOME_DIR/aliases.tsv"
+}
+
+cmd_assign() {
+  # assign <old folder> <key>: give an unattributed folder its project, and remember
+  # that so a repeated migrate or import follows it.
+  [[ $# -eq 2 ]] || die "usage: assign <old folder> <key>"
+  local label=$1 key=$2 res
+  [[ "$label" =~ ^[A-Za-z0-9._-]+$ ]] || die "bad folder name '$label'"
+  valid_key "$key" || die "bad key '$key'"
+  remember_alias "$label" "$key"
+  res=$(move_tree "$HOME_DIR/projects/$UNASSIGNED/$label" "$HOME_DIR/projects/$key" "$label")
+  printf '%s -> %s: %s\n' "$label" "$key" "$res"
+}
+
+cmd_rekey() {
+  # rekey <old key> <new key>: move a project's memory after its remote changed. The
+  # old key redirects to the new one, for machines that still use the old remote.
+  [[ $# -eq 2 ]] || die "usage: rekey <old key> <new key>"
+  local old=$1 new=$2 res
+  valid_key "$old" || die "bad key '$old'"
+  valid_key "$new" || die "bad key '$new'"
+  [[ "$old" != "$new" ]] || die "the keys are the same"
+  [[ "$(follow_redirect "$new")" != "$old" ]] || die "'$new' already redirects to '$old'"
+  remember_alias "$old" "$new"
+  res=$(move_tree "$HOME_DIR/projects/$old" "$HOME_DIR/projects/$new" "${old//\//_}")
+  printf '%s -> %s: %s\n' "$old" "$new" "$res"
+}
+
+cmd_pin() {
+  # pin <key> [dir]: fix this project's key. It takes the existing memory along, and
+  # stays out of the repo's history through .git/info/exclude.
+  [[ $# -ge 1 ]] || die "usage: pin <key> [dir]"
+  local key=$1 dir=${2:-$PWD} root old exclude res
+  valid_key "$key" || die "bad key '$key'"
+  root=$(project_root "$dir")
+  old=$(project_key "$root")
+  printf '%s\n' "$key" > "$root/$PIN_FILE" || die "cannot write $root/$PIN_FILE"
+  if exclude=$(git -C "$root" rev-parse --path-format=absolute --git-path info/exclude 2>/dev/null); then
+    mkdir -p "${exclude%/*}"
+    grep -qxF "$PIN_FILE" "$exclude" 2>/dev/null || printf '%s\n' "$PIN_FILE" >> "$exclude"
+  fi
+  res="nothing to move"
+  if [[ "$old" != "$key" && -d "$HOME_DIR/projects/$old" ]]; then
+    res=$(move_tree "$HOME_DIR/projects/$old" "$HOME_DIR/projects/$key" "${old//\//_}")
+  fi
+  printf 'pinned %s to %s: %s\n' "$root" "$key" "$res"
+}
+
+cmd_unpin() {
+  # unpin [dir]: remove the marker. The key falls back to the remote or the path, and
+  # the memory stays under the pinned key until moved with rekey.
+  local root; root=$(project_root "${1:-$PWD}")
+  rm -f "$root/$PIN_FILE"
+  printf 'key of %s is now %s\n' "$root" "$(project_key "$root")"
+}
+
+cmd_projects() {
+  # Keys that have memory. A key is also the repo's address, for cloning on a new machine.
+  [[ -d "$HOME_DIR/projects" ]] || return 0
+  find "$HOME_DIR/projects" -type f \( -name 'SESSION.md' -o -name 'project.md' -o -path '*/imported/*' \) \
+    | grep -vE '/superseded/' \
+    | sed "s#^$HOME_DIR/projects/##" | sed -E -e 's#/imported/.*##' -e t -e 's#/[^/]+$##' | sort -u
+}
+
+cmd_search() {
+  # search [--here] <query>: BM25 over memory. qmd has no path filter (it silently
+  # ignores --filter), so --here filters its ranked file list. qmd also rewrites
+  # paths, turning dots into dashes, and the key has to be compared in that form.
+  command -v qmd >/dev/null 2>&1 || die "qmd is not installed"
+  if [[ "${1:-}" == --here ]]; then
+    shift; [[ $# -gt 0 ]] || die "usage: search [--here] <query>"
+    local prefix
+    prefix="qmd://memory-3layer/projects/$(project_key | tr '.' '-' | tr '[:upper:]' '[:lower:]')/"
+    qmd search "$*" -c memory-3layer --files -n 200 | awk -F, -v p="$prefix" 'index($3, p) == 1' | head -n 10
+  else
+    [[ $# -gt 0 ]] || die "usage: search [--here] <query>"
+    qmd search "$*" -c memory-3layer -n 5
+  fi
+}
+
+cmd_refresh() {
+  # Rebuild the search index. Vectors stay manual: `qmd embed` takes minutes of CPU.
+  # --debounce is the session-start form: at most every 6 hours, silent without qmd.
+  local marker="$STATE_DIR/last-refresh" last=0
+  mkdir -p "$STATE_DIR"
+  if [[ "${1:-}" == --debounce ]]; then
+    [[ -f "$marker" ]] && last=$(cat "$marker" 2>/dev/null || echo 0)
+    [[ $(( $(date +%s) - last )) -lt 21600 ]] && return 0
+  fi
+  command -v qmd >/dev/null 2>&1 || { [[ "${1:-}" == --debounce ]] && return 0; die "qmd is not installed"; }
+  # The collection is global to the user, so moving the data dir must re-point it.
+  local indexed
+  indexed=$(qmd collection show memory-3layer 2>/dev/null | sed -nE 's/^[[:space:]]*Path:[[:space:]]*//p')
+  if [[ -d "$HOME_DIR" && "$indexed" != "$HOME_DIR" ]]; then
+    [[ -n "$indexed" ]] && qmd collection remove memory-3layer >> "$STATE_DIR/qmd-refresh.log" 2>&1
+    qmd collection add "$HOME_DIR" --name memory-3layer >> "$STATE_DIR/qmd-refresh.log" 2>&1 || true
+  fi
+  qmd update >> "$STATE_DIR/qmd-refresh.log" 2>&1 && date +%s > "$marker"
+}
+
+usage() {
+  cat <<'USAGE'
+memory-3layer — agent memory that belongs to no harness
+
+  path [home|secrets|config|state|identity|project] where things live (default: project)
+  key [dir]                                     the project's stable key
+  context [--hook-format hook|text]             what an agent must read at session start
+  sync [--pull] [--quiet]                       sync with the configured storages
+  sync init <address> | status | check | route [key]
+                                                set the default storage, see state, test access, see routing
+  migrate <harness> [--apply]                   copy data of an older version; plan only by default
+  import <harness> [--apply]                    copy a harness's own memory here; plan only by default
+  pin <key> [dir] / unpin [dir]                 fix a project's key, or go back to remote, then path
+  rekey <old key> <new key>                     move memory after a remote changed
+  projects                                      keys that have memory
+  assign <old folder> <key>                     give an unattributed folder its project
+  search [--here] <query>                       full-text search over memory
+  refresh [--debounce]                          rebuild the search index
+  guard                                         PreToolUse hook: block secrets, allow the data dir
+  secret <command>                              local secret store: put, list, run, scan...
+USAGE
+}
+
+cmd=${1:-}; [[ $# -gt 0 ]] && shift
+case "$cmd" in
+  path)
+    case "${1:-project}" in
+      home) printf '%s\n' "$HOME_DIR" ;;
+      secrets) printf '%s\n' "$SECRETS_DIR" ;;
+      config) printf '%s\n' "$CONFIG_FILE" ;;
+      state) printf '%s\n' "$STATE_DIR" ;;
+      identity) identity_file; echo ;;
+      project) project_dir "${2:-$PWD}"; echo ;;
+      *) die "unknown path '$1'" ;;
+    esac ;;
+  key) project_key "${1:-$PWD}"; echo ;;
+  context) cmd_context "$@" ;;
+  sync) MEMORY_3LAYER_HOME="$HOME_DIR" MEMORY_3LAYER_STATE="$STATE_DIR" MEMORY_3LAYER_CONFIG_DIR="$(dirname "$CONFIG_FILE")" MEMORY_3LAYER_SECRETS="$SECRETS_DIR" exec bash "$SELF_DIR/memory-sync.sh" "$@" ;;
+  migrate) cmd_migrate "$@" ;;
+  import) cmd_import "$@" ;;
+  pin) cmd_pin "$@" ;;
+  unpin) cmd_unpin "$@" ;;
+  rekey) cmd_rekey "$@" ;;
+  projects) cmd_projects ;;
+  assign) cmd_assign "$@" ;;
+  search) cmd_search "$@" ;;
+  refresh) cmd_refresh "$@" ;;
+  guard) MEMORY_3LAYER_HOME="$HOME_DIR" MEMORY_3LAYER_SECRETS="$SECRETS_DIR" exec bash "$SELF_DIR/memory-secrets.sh" guard ;;
+  secret) MEMORY_3LAYER_HOME="$HOME_DIR" MEMORY_3LAYER_SECRETS="$SECRETS_DIR" exec bash "$SELF_DIR/memory-secrets.sh" "$@" ;;
+  ''|-h|--help|help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
